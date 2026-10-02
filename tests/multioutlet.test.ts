@@ -364,6 +364,7 @@ describe("Multi owner dan multi outlet", () => {
         ),
         after = schema.slice(
           schema.indexOf("CREATE OR REPLACE FUNCTION verify_journal_balance"),
+          schema.indexOf("CREATE TABLE IF NOT EXISTS business_members"),
         );
       await legacy.exec(before + after);
       const bid = uid(),

@@ -19,17 +19,21 @@ import { hash, passwordHash, verifyPassword } from "./security";
 import { createBusiness } from "./seed";
 import { accessibleOutlets } from "./access";
 import { createOutlet } from "./outlets";
+import { registerCore, syncOperationalDocuments, channelSchema } from "./core";
 
-type User = {
+export type User = {
   id: string;
   business_id: string;
   organization_id: string;
   name: string;
   email: string;
-  role: "owner" | "cashier";
+  role: "owner" | "cashier" | "manager" | "investor";
+  member_role?: string;
 };
-type Environment = { Variables: { db: Database; user: User; outlets: any[] } };
-type C = Context<Environment>;
+export type Environment = {
+  Variables: { db: Database; user: User; outlets: any[] };
+};
+export type C = Context<Environment>;
 const text = z.string().trim().min(1).max(150);
 const money = z.coerce.number().int().min(0).max(100000000000);
 const positive = z.coerce
@@ -49,6 +53,10 @@ const activeShift = async (tx: Queryable, bid: string) => {
   ).rows[0];
   if (!shift) throw new DomainError("Buka shift terlebih dahulu.");
   return shift;
+};
+const operator = (c: C) => {
+  if (!["owner", "manager"].includes(c.get("user").role))
+    throw new DomainError("Akses manager diperlukan.", 403);
 };
 const owner = (c: C) => {
   if (c.get("user").role !== "owner")
@@ -92,17 +100,17 @@ async function mutate(
     JSON.stringify({ user: user.id, action, input }),
   );
   const result = await c.get("db").transaction(async (tx) => {
-    if (
-      [
-        "user.create",
-        "outlet.create",
-        "organization.create",
-        "business.update",
-      ].includes(action)
-    )
-      await tx.query("SELECT id FROM organizations WHERE id=$1 FOR UPDATE", [
-        user.organization_id,
-      ]);
+    await tx.query("SELECT id FROM organizations WHERE id=$1 FOR UPDATE", [
+      user.organization_id,
+    ]);
+    const active = (await accessibleOutlets(tx, user.id)).find(
+      (o) => o.id === user.business_id,
+    );
+    if (!active || active.role !== user.role)
+      throw new DomainError(
+        "Akses berubah. Muat ulang atau masuk kembali.",
+        403,
+      );
     const business = (
       await tx.query("SELECT * FROM businesses WHERE id=$1 FOR UPDATE", [
         user.business_id,
@@ -129,13 +137,18 @@ async function mutate(
     if (
       !allowClosed &&
       business.closed_through &&
-      String(business.closed_through).slice(0, 10) >= day
+      (business.closed_through instanceof Date
+        ? business.closed_through.toISOString()
+        : String(business.closed_through)
+      ).slice(0, 10) >= day
     )
       throw new DomainError(
         "Periode hari ini sudah dikunci. Buka kembali melalui pengaturan.",
         409,
       );
+    await syncOperationalDocuments(tx, user.business_id, user);
     const data = await fn(tx, user, business, day);
+    await syncOperationalDocuments(tx, user.business_id, user);
     await audit(tx, user, action, {
       input:
         action === "user.create"
@@ -309,10 +322,27 @@ export function createApp(
       business_id: selected.id,
       organization_id: selected.organization_id,
       role: selected.role,
+      member_role: selected.member_role,
     } as User);
     c.set("outlets", outlets);
     await next();
   });
+  app.use("/api/*", async (c, next) => {
+    if (
+      c.get("user").role === "investor" &&
+      !["/api/state", "/api/logout"].includes(c.req.path) &&
+      !(
+        c.req.path.startsWith("/api/core/reports") ||
+        c.req.path === "/api/core/state"
+      )
+    )
+      throw new DomainError(
+        "Investor hanya dapat membaca laporan terbit.",
+        403,
+      );
+    await next();
+  });
+  registerCore(app, mutate);
   app.post("/api/logout", async (c) => {
     await db.query("DELETE FROM sessions WHERE token_hash=$1", [
       await hash(getCookie(c, "omzetin_session")!),
@@ -329,6 +359,22 @@ export function createApp(
       ).rows[0];
       await tx.query("SELECT set_config('app.business_id',$1,true)", [bid]);
       const day = businessDay(business.timezone);
+      if (user.role === "investor")
+        return {
+          user,
+          business: {
+            id: business.id,
+            organization_id: business.organization_id,
+            name: business.name,
+            outlet_name: business.outlet_name,
+            timezone: business.timezone,
+          },
+          day,
+          products: [],
+          orders: [],
+          shifts: [],
+          currentShift: null,
+        };
       const ingredients = (
         await tx.query(
           "SELECT *, (quantity-reserved)::text available, CASE WHEN quantity>0 THEN (value/quantity)::text ELSE '0' END unit_cost FROM ingredients WHERE business_id=$1 ORDER BY name",
@@ -375,6 +421,23 @@ export function createApp(
             [bid, currentShift.id],
           )
         ).rows[0].amount;
+      if (user.role === "manager")
+        return {
+          user,
+          business,
+          day,
+          products,
+          ingredients,
+          orders,
+          shifts,
+          currentShift: currentShift ? { ...currentShift, expected } : null,
+          movements: (
+            await tx.query(
+              "SELECT s.*,i.name,i.unit FROM stock_movements s JOIN ingredients i ON i.id=s.ingredient_id WHERE s.business_id=$1 ORDER BY s.created_at DESC LIMIT 100",
+              [bid],
+            )
+          ).rows,
+        };
       if (user.role !== "owner")
         return {
           user,
@@ -485,7 +548,7 @@ export function createApp(
         )
       ).rows[0];
     if (!order) throw new DomainError("Pesanan tidak ditemukan.", 404);
-    if (user.role === "cashier") {
+    if (user.role !== "owner") {
       delete order.cost;
       delete order.consumption;
       order.items = order.items.map(({ recipe, ...item }: any) => item);
@@ -546,7 +609,10 @@ export function createApp(
     return c.json(result);
   });
   app.post("/api/shifts/open", async (c) => {
-    const input = await body(c, z.object({ opening: money }));
+    const input = await body(
+      c,
+      z.object({ opening: money, label: text.optional() }),
+    );
     return mutate(c, "shift.open", input, async (tx, user, _b, day) => {
       if (
         (
@@ -559,9 +625,13 @@ export function createApp(
         throw new DomainError("Masih ada shift yang aktif.", 409);
       await requireFunds(tx, user.business_id, "safe", input.opening);
       const sid = uid();
+      const schedule = _b.operating_schedule;
+      const label = input.label || schedule.shifts[0].name;
+      if (!schedule.shifts.some((s: any) => s.name === label))
+        throw new DomainError("Shift tidak tersedia.", 422);
       await tx.query(
-        "INSERT INTO shifts(id,business_id,user_id,opening) VALUES($1,$2,$3,$4)",
-        [sid, user.business_id, user.id, input.opening],
+        "INSERT INTO shifts(id,business_id,user_id,opening,label,business_date) VALUES($1,$2,$3,$4,$5,$6)",
+        [sid, user.business_id, user.id, input.opening, label, day],
       );
       if (input.opening)
         await post(
@@ -586,7 +656,7 @@ export function createApp(
     );
     return mutate(c, "shift.close", input, async (tx, user, _b, day) => {
       const shift = await activeShift(tx, user.business_id);
-      if (shift.user_id !== user.id) owner(c);
+      if (shift.user_id !== user.id) operator(c);
       if (
         (
           await tx.query(
@@ -608,7 +678,6 @@ export function createApp(
       );
       const difference = D(input.counted).minus(expected);
       if (!difference.eq(0)) {
-        owner(c);
         if (!input.note) throw new DomainError("Jelaskan alasan selisih kas.");
         await post(
           tx,
@@ -641,6 +710,25 @@ export function createApp(
           ],
           shift.id,
         );
+      const transfers = (
+        await tx.query(
+          "SELECT COALESCE(sum(total),0)::text amount FROM orders WHERE business_id=$1 AND shift_id=$2 AND channel='transfer' AND status='fulfilled'",
+          [user.business_id, shift.id],
+        )
+      ).rows[0].amount;
+      if (D(transfers).gt(0))
+        await post(
+          tx,
+          user.business_id,
+          day,
+          `transfer-final:${shift.id}`,
+          "Transfer terverifikasi pada shift",
+          [
+            { account: "bank", debit: transfers },
+            { account: "clearing", credit: transfers },
+          ],
+          shift.id,
+        );
       await tx.query(
         "UPDATE shifts SET closed_at=now(),counted=$1,expected=$2,difference=$3,note=$4 WHERE id=$5 AND business_id=$6",
         [
@@ -670,18 +758,23 @@ export function createApp(
           .max(50),
         discount: money,
         paymentMethod: z.enum(["cash", "digital"]),
+        channel: channelSchema.optional(),
         tendered: money,
         reference: z.string().trim().max(150),
         service: z.enum(["dine_in", "takeaway"]),
         note: z.string().trim().max(500),
       }),
     );
-    if (input.discount) owner(c);
+    if (input.discount) operator(c);
     return mutate(c, "order.pay", input, async (tx, user, _b, day) => {
       const bid = user.business_id,
         shift = await activeShift(tx, bid);
       if (shift.user_id !== user.id)
         throw new DomainError("Shift sedang digunakan kasir lain.", 409);
+      const paymentChannel =
+        input.channel || (input.paymentMethod === "cash" ? "cash" : "qris");
+      if ((paymentChannel === "cash") !== (input.paymentMethod === "cash"))
+        throw new DomainError("Kanal dan metode pembayaran tidak cocok.", 422);
       const snapshot: any[] = [],
         consumption: Record<string, any> = {};
       let subtotal = D(0);
@@ -764,6 +857,10 @@ export function createApp(
           ],
         )
       ).rows[0];
+      await tx.query("UPDATE orders SET channel=$1 WHERE id=$2", [
+        paymentChannel,
+        oid,
+      ]);
       await post(
         tx,
         bid,
@@ -874,7 +971,7 @@ export function createApp(
     );
   });
   app.post("/api/orders/:id/refund", async (c) => {
-    owner(c);
+    operator(c);
     const oid = id.parse(c.req.param("id"));
     const input = await body(
       c,
@@ -894,10 +991,57 @@ export function createApp(
         if (!order) throw new DomainError("Pesanan tidak ditemukan.", 404);
         if (!["queued", "fulfilled"].includes(order.status))
           throw new DomainError("Pesanan sudah dibatalkan atau direfund.", 409);
-        const shift = await activeShift(tx, user.business_id),
-          paymentAccount =
-            order.payment_method === "cash" ? "cash" : "clearing";
-        await requireFunds(tx, user.business_id, paymentAccount, order.total);
+        const shift = await activeShift(tx, user.business_id);
+        const doc = (
+          await tx.query(
+            "SELECT d.*,COALESCE((SELECT sum(gross) FROM income_receipts WHERE document_id=d.id),0)::text received FROM operational_documents d WHERE business_id=$1 AND source_key=$2 FOR UPDATE",
+            [user.business_id, `shift:${order.shift_id}:${order.channel}`],
+          )
+        ).rows[0];
+        const credits: any[] = [];
+        if (order.payment_method === "cash")
+          credits.push({ account: "cash", credit: order.total });
+        else if (doc && order.channel === "transfer")
+          credits.push({ account: "bank", credit: order.total });
+        else if (doc) {
+          const outstanding = D(doc.amount).minus(doc.received),
+            unreceived = outstanding.lt(order.total)
+              ? outstanding
+              : D(order.total),
+            returned = D(order.total).minus(unreceived);
+          if (unreceived.gt(0)) {
+            const original = (
+              await tx.query(
+                "SELECT closed_through FROM businesses WHERE id=$1",
+                [user.business_id],
+              )
+            ).rows[0];
+            if (
+              original.closed_through &&
+              (original.closed_through instanceof Date
+                ? original.closed_through.toISOString()
+                : String(original.closed_through)
+              ).slice(0, 10) >=
+                (doc.business_date instanceof Date
+                  ? doc.business_date.toISOString()
+                  : String(doc.business_date)
+                ).slice(0, 10)
+            )
+              throw new DomainError(
+                "Buka periode asal sebelum mengoreksi dana platform yang belum cair.",
+                409,
+              );
+            credits.push({ account: "clearing", credit: unreceived });
+            await tx.query(
+              "UPDATE operational_documents SET amount=amount-$1,status='submitted',version=version+1,reviewed_by=NULL,reviewed_at=NULL,review_note=$2 WHERE id=$3",
+              [unreceived.toFixed(0), input.reason, doc.id],
+            );
+          }
+          if (returned.gt(0))
+            credits.push({ account: "bank", credit: returned });
+        } else credits.push({ account: "clearing", credit: order.total });
+        for (const line of credits)
+          await requireFunds(tx, user.business_id, line.account, line.credit);
         if (order.status === "queued")
           for (const r of order.consumption) {
             const ingredient = (
@@ -959,7 +1103,7 @@ export function createApp(
               account: order.status === "queued" ? "advance" : "returns",
               debit: order.total,
             },
-            { account: paymentAccount, credit: order.total },
+            ...credits,
           ],
           shift.id,
           oid,
@@ -978,7 +1122,7 @@ export function createApp(
     );
   });
   app.post("/api/ingredients", async (c) => {
-    owner(c);
+    operator(c);
     const input = await body(
       c,
       z.object({
@@ -997,7 +1141,7 @@ export function createApp(
     });
   });
   app.post("/api/products", async (c) => {
-    owner(c);
+    operator(c);
     const input = await body(
       c,
       z.object({
@@ -1075,7 +1219,7 @@ export function createApp(
     });
   });
   app.post("/api/stock", async (c) => {
-    owner(c);
+    operator(c);
     const input = await body(
       c,
       z
@@ -1246,6 +1390,18 @@ export function createApp(
       }),
     );
     return mutate(c, "settlement.create", input, async (tx, user, _b, day) => {
+      if (
+        (
+          await tx.query(
+            "SELECT id FROM orders WHERE business_id=$1 AND channel IN ('gojek','grab','transfer') LIMIT 1",
+            [user.business_id],
+          )
+        ).rows.length
+      )
+        throw new DomainError(
+          "Gunakan pencairan per dokumen melalui Aplikasi Manager untuk bisnis dengan beberapa kanal.",
+          422,
+        );
       if (input.fee >= input.gross)
         throw new DomainError("Biaya harus lebih kecil dari nilai bruto.");
       await requireFunds(tx, user.business_id, "clearing", input.gross);
@@ -1407,6 +1563,22 @@ export function createApp(
             );
           }
         }
+        await tx.query(
+          "INSERT INTO business_members(organization_id,user_id,role,all_outlets) VALUES($1,$2,$3,$4) ON CONFLICT(organization_id,user_id) DO UPDATE SET role=excluded.role,active=true,all_outlets=excluded.all_outlets",
+          [
+            business.organization_id,
+            account.id,
+            input.role === "owner" ? "management" : "employee",
+            input.role === "owner",
+          ],
+        );
+        for (const outletId of input.role === "cashier"
+          ? input.outletIds || [user.business_id]
+          : [])
+          await tx.query(
+            "INSERT INTO member_outlets(organization_id,user_id,outlet_id) VALUES($1,$2,$3) ON CONFLICT DO NOTHING",
+            [business.organization_id, account.id, outletId],
+          );
         return { id: account.id, linked: !!existing };
       },
       true,
@@ -1475,6 +1647,10 @@ export function createApp(
           "INSERT INTO organization_owners(organization_id,user_id) VALUES($1,$2)",
           [organizationId, user.id],
         );
+        await tx.query(
+          "INSERT INTO business_members(organization_id,user_id,role,all_outlets) VALUES($1,$2,'management',true)",
+          [organizationId, user.id],
+        );
         const outletId = await createOutlet(tx, {
           organizationId,
           brand: input.name,
@@ -1539,7 +1715,11 @@ export function createApp(
             throw new DomainError("Tidak bisa mengunci tanggal di masa depan.");
           if (
             business.closed_through &&
-            input.date < String(business.closed_through).slice(0, 10)
+            input.date <
+              (business.closed_through instanceof Date
+                ? business.closed_through.toISOString()
+                : String(business.closed_through)
+              ).slice(0, 10)
           )
             throw new DomainError(
               "Gunakan buka kembali untuk koreksi periode.",
@@ -1578,6 +1758,14 @@ export function createApp(
       return c.json({ error: error.message }, error.status as any);
     if (error instanceof z.ZodError)
       return c.json({ error: "Data tidak valid." }, 422);
+    if ((error as any).code === "23505")
+      return c.json(
+        {
+          error:
+            "Referensi atau data sudah tercatat. Periksa sebelum mengulang.",
+        },
+        409,
+      );
     console.error(
       "Omzetin request failed:",
       error instanceof Error ? error.message : "unknown",

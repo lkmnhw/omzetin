@@ -1,4 +1,6 @@
-export const schema = `
+import { coreSchema } from "./core-schema";
+export const schema =
+  `
 CREATE EXTENSION IF NOT EXISTS pgcrypto;
 CREATE TABLE IF NOT EXISTS businesses (
  id uuid PRIMARY KEY, name text NOT NULL, outlet_name text NOT NULL,
@@ -134,4 +136,4 @@ DO $$ BEGIN
  CREATE CONSTRAINT TRIGGER balanced_lines AFTER INSERT OR UPDATE OR DELETE ON journal_lines DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION verify_journal_balance();
  END IF;
 END $$;
-`;
+` + coreSchema;

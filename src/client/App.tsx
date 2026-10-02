@@ -52,6 +52,7 @@ import {
   selectOutlet,
 } from "./api";
 import Reports from "./Reports";
+import CorePortal from "./CorePortal";
 
 type State = Record<string, any>;
 type Modal = { kind: string; data?: any };
@@ -315,7 +316,17 @@ export default function App() {
       />
     );
   return (
-    <Workspace
+    <CorePortal
+      workspace={(view) => (
+        <Workspace
+          view={view}
+          key={view}
+          state={state}
+          refresh={load}
+          onOutlet={async () => {}}
+          onLogout={async () => {}}
+        />
+      )}
       key={`${state.user.id}:${state.business.id}:${state.user.role}`}
       state={state}
       refresh={load}
@@ -532,13 +543,17 @@ function Workspace({
   refresh,
   onLogout,
   onOutlet,
+  view,
 }: {
+  view: "cashier" | "inventory" | "settings";
   state: State;
   refresh: () => Promise<State | null>;
   onLogout: () => Promise<void>;
   onOutlet: (id: string) => Promise<void>;
 }) {
-  const [page, setPage] = useState("overview"),
+  const [page, setPage] = useState(
+      view === "cashier" ? "pos" : view === "inventory" ? "stock" : "settings",
+    ),
     [modal, setModal] = useState<Modal | null>(null),
     [busy, setBusy] = useState(false),
     [toast, setToast] = useState(""),
@@ -546,7 +561,7 @@ function Workspace({
     [search, setSearch] = useState(""),
     [category, setCategory] = useState("Semua"),
     [orderFilter, setOrderFilter] = useState("all");
-  const owner = s.user.role === "owner",
+  const owner = s.user.role === "owner" || s.user.role === "manager",
     draftKey = `omzetin:draft:${s.user.business_id}:${s.user.id}`;
   const [cart, setCart] = useState<CartItem[]>(() => {
     try {
@@ -571,8 +586,10 @@ function Workspace({
     localStorage.setItem(draftKey, JSON.stringify(cart));
   }, [cart, draftKey]);
   useEffect(() => {
-    if (!owner) setPage("pos");
-  }, [owner]);
+    setPage(
+      view === "cashier" ? "pos" : view === "inventory" ? "stock" : "settings",
+    );
+  }, [view]);
   useEffect(() => {
     if (!toast) return;
     const timer = setTimeout(() => setToast(""), 4500);
@@ -712,7 +729,14 @@ function Workspace({
         <div className="workspace-label">WORKSPACE</div>
         <nav aria-label="Navigasi utama">
           {nav
-            .filter((n) => owner || ["pos", "orders"].includes(n.id))
+            .filter((n) =>
+              (view === "cashier"
+                ? ["pos", "orders"]
+                : view === "inventory"
+                  ? ["stock", "menu"]
+                  : ["settings", "finance"]
+              ).includes(n.id),
+            )
             .map((n) => (
               <button
                 key={n.id}
@@ -1670,13 +1694,10 @@ function Workspace({
                   <Plus size={17} />
                   Modal / transfer uang
                 </button>
-                <button
-                  className="btn secondary"
-                  onClick={() => open("settlement")}
-                >
-                  <CreditCard size={17} />
-                  Catat pencairan digital
-                </button>
+                <span className="date-label">
+                  Pencairan final dicatat melalui Pendapatan pada Aplikasi
+                  Manager.
+                </span>
               </div>
               <section className="panel">
                 <div className="panel-heading">
@@ -1980,36 +2001,13 @@ function Workspace({
                 <section className="panel">
                   <div className="panel-heading">
                     <div>
-                      <h2>Tim usaha</h2>
-                      <p>Akses sesuai tanggung jawab</p>
+                      <h2>Tim & hak akses</h2>
+                      <p>
+                        Kelola management, manager, karyawan, dan investor
+                        melalui menu Tim & akses pada Aplikasi Manager.
+                      </p>
                     </div>
-                    <button
-                      className="btn secondary compact"
-                      onClick={() => open("user")}
-                    >
-                      <Plus size={15} />
-                      Pengguna
-                    </button>
                   </div>
-                  {s.users.map((u: any) => (
-                    <div className="team-member" key={u.id}>
-                      <span className="avatar">{u.name[0]}</span>
-                      <div>
-                        <strong>{u.name}</strong>
-                        <small>{u.email}</small>
-                        <small>
-                          {u.role === "owner"
-                            ? "Seluruh outlet usaha ini"
-                            : u.assigned_outlets
-                                .map((o: any) => o.name)
-                                .join(", ")}
-                        </small>
-                      </div>
-                      <span className="stock-badge">
-                        {u.role === "owner" ? "Pemilik" : "Kasir"}
-                      </span>
-                    </div>
-                  ))}
                 </section>
               </div>
               <section className="panel spaced">
@@ -2229,6 +2227,7 @@ function ModalDialog({
 }) {
   const box = useRef<HTMLDivElement>(null),
     [payment, setPayment] = useState("cash"),
+    [channel, setChannel] = useState("qris"),
     [discount, setDiscount] = useState(0),
     [recipe, setRecipe] = useState<any[]>(modal.data?.recipe || []),
     [stockKind, setStockKind] = useState("purchase"),
@@ -2295,7 +2294,7 @@ function ModalDialog({
     switch (modal.kind) {
       case "shift-open":
         path = "/shifts/open";
-        input = { opening: n(data, "opening") };
+        input = { opening: n(data, "opening"), label: f(data, "label") };
         message = "Shift dibuka. Kasir siap menerima pesanan.";
         break;
       case "shift-close":
@@ -2429,6 +2428,7 @@ function ModalDialog({
           })),
           discount,
           paymentMethod: payment,
+          channel: payment === "cash" ? "cash" : channel,
           tendered:
             payment === "digital" ? subtotal - discount : n(data, "tendered"),
           reference: f(data, "reference"),
@@ -2575,6 +2575,13 @@ function ModalDialog({
                     ? `Saldo brankas: ${rupiah(s.balances?.find((b: any) => b.account === "safe")?.balance || 0)}.`
                     : "Ketersediaan modal diverifikasi saat shift dibuka."}
                 </div>
+                <Field label="Nama shift">
+                  <select name="label">
+                    {s.business.operating_schedule.shifts.map((shift: any) => (
+                      <option key={shift.name}>{shift.name}</option>
+                    ))}
+                  </select>
+                </Field>
                 <Field label="Modal kas yang dihitung">
                   <MoneyInput name="opening" initial={100000} />
                 </Field>
@@ -2585,7 +2592,7 @@ function ModalDialog({
                 <div className="inline-note">
                   <ShieldCheck size={19} />
                   Hitung uang fisik terlebih dahulu. Selisih membutuhkan alasan
-                  dan persetujuan pemilik.
+                  dan pemeriksaan manager.
                 </div>
                 <Field label="Jumlah uang fisik di laci">
                   <MoneyInput name="counted" />
@@ -2651,6 +2658,17 @@ function ModalDialog({
                   </Field>
                 ) : (
                   <>
+                    <Field label="Kanal pembayaran">
+                      <select
+                        value={channel}
+                        onChange={(e) => setChannel(e.target.value)}
+                      >
+                        <option value="qris">QRIS</option>
+                        <option value="gojek">Gojek</option>
+                        <option value="grab">Grab</option>
+                        <option value="transfer">Transfer</option>
+                      </select>
+                    </Field>
                     <Field label="Referensi pembayaran">
                       <input
                         name="reference"

@@ -1,5 +1,6 @@
 import { neonDatabase } from "../src/server/db";
 import { schema } from "../src/server/schema";
+import { reconcileCore } from "../src/server/reconcile";
 import { existsSync } from "node:fs";
 if (existsSync(".env")) process.loadEnvFile(".env");
 if (!process.env.DATABASE_URL)
@@ -7,6 +8,7 @@ if (!process.env.DATABASE_URL)
 const db = neonDatabase(process.env.DATABASE_URL);
 try {
   await db.query(schema);
+  await db.transaction(reconcileCore);
   console.log("Omzetin schema ready. No demo data inserted.");
 } finally {
   await db.close();

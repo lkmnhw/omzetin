@@ -32,6 +32,10 @@ export async function createBusiness(
     "INSERT INTO organization_owners(organization_id,user_id) VALUES($1,$2)",
     [organization, user],
   );
+  await tx.query(
+    "INSERT INTO business_members(organization_id,user_id,role,all_outlets) VALUES($1,$2,'management',true)",
+    [organization, user],
+  );
   if (input.capital)
     await post(
       tx,

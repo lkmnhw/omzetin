@@ -6,6 +6,7 @@ import { localDatabase } from "./db";
 import { schema } from "./schema";
 import { seedDemo } from "./seed";
 import { createApp } from "./app";
+import { reconcileCore } from "./reconcile";
 await mkdir(".local", { recursive: true });
 const pg = new PGlite({
   dataDir:
@@ -17,6 +18,7 @@ const pg = new PGlite({
 await pg.exec(schema);
 const db = localDatabase(pg);
 await seedDemo(db);
+await db.transaction(reconcileCore);
 const app = createApp(db, {
   demo: true,
   localOrigin: process.env.OMZETIN_ORIGIN || "http://127.0.0.1:5173",
